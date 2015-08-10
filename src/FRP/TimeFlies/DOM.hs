@@ -8,12 +8,14 @@
 module FRP.TimeFlies.DOM where
 
 import           Data.JSString (JSString)
+import qualified Data.JSString as JSString (unpack)
 import           Data.JSString.Text (textToJSString, textFromJSString)
 import qualified Data.Text as T
 import           FRP.TimeFlies
 import           GHCJS.VDOM
 import           GHCJS.VDOM.Attribute (Attribute)
 import           GHCJS.VDOM.Element (custom, text)
+import           GHCJS.VDOM.Event
 import           Prelude hiding (filter)
 
 -- | Lifted kind for position of a widget in our DOM representation.
@@ -40,7 +42,8 @@ instance (RouteWidget path) => RouteWidget (WidgetRight path) where
 -- | Combining by widget paths
 data WidgetProd (path :: WidgetPath) a where
   WidgetProdUnit :: a -> WidgetProd path a
-  WidgetProdTimes :: WidgetProd (WidgetLeft path) a -> WidgetProd (WidgetRight path) a -> WidgetProd path a
+  WidgetProdConcat :: WidgetProd (WidgetLeft path) a -> WidgetProd (WidgetRight path) a -> WidgetProd path a
+  WidgetProdParentChild :: a -> WidgetProd (WidgetRight path) a -> WidgetProd path a
 
 -- | Two signal functions combined so that the input/output of the left is the left input/output
 -- (mutatis mutandis right)
@@ -58,7 +61,7 @@ concatWidgets :: ((SVEvent (WidgetSum (WidgetLeft path) a) :^: SVEvent (WidgetSu
 concatWidgets sv =
   let inputTransformer = 
         first $ filter widgetSumLeft &&& filter widgetSumRight
-      outputTransformer = first $ combineSignals $ uncurry WidgetProdTimes
+      outputTransformer = first $ combineSignals $ uncurry WidgetProdConcat
   in inputTransformer >>> sv >>> outputTransformer
   where
     widgetSumLeft :: WidgetSum path a -> Maybe (WidgetSum (WidgetLeft path) a)
@@ -69,10 +72,105 @@ concatWidgets sv =
     widgetSumRight (WidgetSumRight sum) = Just sum
     widgetSumRight _ = Nothing
 
+-- | Make the left widget the parent of the right widget in the DOM
+containWidget :: (forall c . (Children c) => [Attribute] -> c -> VNode)
+              -> (SVEvent (WidgetSum (WidgetRight path) a) :^: svIn) 
+                 :~> (SVSignal (WidgetProd (WidgetRight path) GnatDOM) :^: svOut)
+              -> (SVEvent (WidgetSum path a) :^: svIn) :~> (SVSignal (WidgetProd path GnatDOM) :^: (SVEvent a :^: svOut))
+containWidget parentF sv =
+  let inputTransformer = copy >>>
+                         second (second ignore >>> cancelRight >>> filter widgetSumStop) >>>
+                         first (first $ filter widgetSumRight)
+      middle = sv *** (uncancelLeft >>> (first $ constant $ Element parentF))
+  in inputTransformer >>> middle >>> (first swap >>> associate >>> second unassociate >>> swap >>> associate >>> first (combineSignals $ uncurry $ flip WidgetProdParentChild))
+  where
+    widgetSumRight :: WidgetSum path a -> Maybe (WidgetSum (WidgetRight path) a)
+    widgetSumRight (WidgetSumRight sum) = Just sum
+    widgetSumRight _ = Nothing
+
+    widgetSumStop :: WidgetSum path a -> Maybe a
+    widgetSumStop (WidgetSumStop x) = Just x
+    widgetSumStop _ = Nothing
+
 -- | Gnats representation of DOM
 data GnatDOM
   = Element (forall c. (Children c) => [Attribute] -> c -> VNode)
   | Text T.Text
+
+-- | Compile an output tree to a VNode
+compileGnat :: (RouteWidget path)
+            => (WidgetSum WidgetStop GnatEvent -> IO ())
+            -> WidgetProd path GnatDOM
+            -> [VNode]
+compileGnat _ (WidgetProdUnit (Text t)) = [text $ textToJSString t]
+compileGnat handler prod@(WidgetProdUnit (Element f)) = 
+  let eventAttributes = map ($ handler . routeWidgetProd prod . WidgetSumStop) gnatEvents
+  in [f eventAttributes ()]
+compileGnat handler (WidgetProdConcat left right) = compileGnat handler left ++ compileGnat handler right
+compileGnat handler prod@(WidgetProdParentChild (Element parentF) child) =
+  let eventAttributes = map ($ handler . routeWidgetProd prod . WidgetSumStop) gnatEvents
+  in [parentF eventAttributes $ compileGnat handler child]
+compileGnat handler prod@(WidgetProdParentChild (Text t) _) = -- need to fix this :\
+  [text $ textToJSString t]
+
+-- | Events to watch on each element
+gnatEvents :: [(GnatEvent -> IO ()) -> Attribute]
+gnatEvents = 
+  [ mkMouseEvent click MouseClick
+  , mkMouseEvent dblclick MouseDoubleClick
+  , mkMouseEvent mousedown MouseDown
+  , mkMouseEvent mouseenter MouseEnter
+  , mkMouseEvent mouseleave MouseLeave
+  , mkMouseEvent mousemove MouseMove
+  , mkMouseEvent mouseout MouseOut
+  , mkMouseEvent mouseover MouseOver
+  , mkMouseEvent mouseup MouseUp
+  , mkKeyEvent keydown KeyDown
+  , mkKeyEvent keypress KeyPress
+  , mkKeyEvent keyup KeyUp
+  , mkFocusEvent focus Focus
+  , mkFocusEvent blur Blur
+  , mkGenericEvent submit Submit
+  , mkGenericEvent change Change
+  ]
+
+  where
+    mkMouseEvent :: ((MouseEvent -> IO ()) -> Attribute)
+                 -> (MouseLocation -> GnatEvent)
+                 -> (GnatEvent -> IO ())
+                 -> Attribute
+    mkMouseEvent attributeMaker constructor handler =
+      attributeMaker (\mouseEvt -> handler (constructor $ MouseLocation (clientX mouseEvt) (clientY mouseEvt) (button mouseEvt)))
+
+    mkKeyEvent :: ((KeyboardEvent -> IO ()) -> Attribute)
+               -> (Key -> GnatEvent)
+               -> (GnatEvent -> IO ())
+               -> Attribute
+    mkKeyEvent attributeMaker constructor handler =
+      attributeMaker (\keyEvt -> handler (constructor $ Key (head $ JSString.unpack $ key keyEvt)
+                                                            (ctrlKey keyEvt)
+                                                            (metaKey keyEvt)
+                                                            (shiftKey keyEvt)))
+
+    mkFocusEvent :: ((FocusEvent -> IO ()) -> Attribute)
+                 -> GnatEvent
+                 -> (GnatEvent -> IO ())
+                 -> Attribute
+    mkFocusEvent attributeMaker constructor handler = 
+      attributeMaker $ const $ handler constructor
+
+    mkGenericEvent :: ((Event -> IO ()) -> Attribute)
+                   -> GnatEvent
+                   -> (GnatEvent -> IO ())
+                   -> Attribute
+    mkGenericEvent attributeMaker constructor handler =
+     attributeMaker $ const $ handler constructor
+              
+   
+
+-- | lets us force the type variable in the path
+routeWidgetProd :: (RouteWidget path) => WidgetProd path b -> WidgetSum path a -> WidgetSum WidgetStop a
+routeWidgetProd = const routeWidget
 
 -- | Gnats representation of DOM event
 data GnatEvent
@@ -98,7 +196,7 @@ data MouseLocation
   = MouseLocation
     { _mouseX :: Int
     , _mouseY :: Int
-    , button  :: Int
+    , _button  :: Int
     }
 
 data WheelDelta
