@@ -3,23 +3,36 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module FRP.TimeFlies.DOM where
 
+import           Control.Concurrent.MVar
 import           Data.JSString (JSString)
 import qualified Data.JSString as JSString (unpack)
 import           Data.JSString.Text (textToJSString, textFromJSString)
 import qualified Data.Text as T
 import           FRP.TimeFlies
+import           GHCJS.Foreign.Callback
+import           GHCJS.Foreign.QQ
 import           GHCJS.VDOM
 import           GHCJS.VDOM.Attribute (Attribute)
 import           GHCJS.VDOM.Element (custom, text)
 import           GHCJS.VDOM.Event
+import           GHCJS.VDOM.Render
 import           Prelude hiding (filter)
+import           System.IO (fixIO)
+
 
 -- | Lifted kind for position of a widget in our DOM representation.
 data WidgetPath = WidgetStop | WidgetLeft WidgetPath | WidgetRight WidgetPath
+
+type Widget (path :: WidgetPath) svIn svOut = (SVEvent (WidgetSum path GnatEvent) :^: svIn) :~> (SVSignal (WidgetProd path GnatDOM) :^: svOut)
+
+type PreConcatWidget (path :: WidgetPath) svIn svOut =   ((SVEvent (WidgetSum (WidgetLeft path) GnatEvent) :^: SVEvent (WidgetSum (WidgetRight path) GnatEvent)) :^: svIn)
+                                                     :~> ((SVSignal (WidgetProd (WidgetLeft path) GnatDOM) :^: SVSignal (WidgetProd (WidgetRight path) GnatDOM)) :^: svOut)
 
 -- | Routing by widget paths
 data WidgetSum (path :: WidgetPath) a where
@@ -55,9 +68,8 @@ left *** right = first left >>> second right
 left &&& right = copy >>> (left *** right)
 
 -- | Concatenate two widgets so that one follows the other in the DOM
-concatWidgets :: ((SVEvent (WidgetSum (WidgetLeft path) a) :^: SVEvent (WidgetSum (WidgetRight path) a)) :^: svIn) 
-                  :~> ((SVSignal (WidgetProd (WidgetLeft path) b) :^: SVSignal (WidgetProd (WidgetRight path) b)) :^: svOut)
-              -> (SVEvent (WidgetSum path a) :^: svIn) :~> (SVSignal (WidgetProd path b) :^: svOut)
+concatWidgets :: PreConcatWidget path svIn svOut
+              -> Widget path svIn svOut
 concatWidgets sv =
   let inputTransformer = 
         first $ filter widgetSumLeft &&& filter widgetSumRight
@@ -74,9 +86,8 @@ concatWidgets sv =
 
 -- | Make the left widget the parent of the right widget in the DOM
 containWidget :: (forall c . (Children c) => [Attribute] -> c -> VNode)
-              -> (SVEvent (WidgetSum (WidgetRight path) a) :^: svIn) 
-                 :~> (SVSignal (WidgetProd (WidgetRight path) GnatDOM) :^: svOut)
-              -> (SVEvent (WidgetSum path a) :^: svIn) :~> (SVSignal (WidgetProd path GnatDOM) :^: (SVEvent a :^: svOut))
+              -> Widget (WidgetRight path) svIn svOut
+              -> Widget path svIn (SVEvent GnatEvent :^: svOut)
 containWidget parentF sv =
   let inputTransformer = copy >>>
                          second (second ignore >>> cancelRight >>> filter widgetSumStop) >>>
@@ -215,10 +226,10 @@ data Key
   , _keyShift :: Bool
   }
 
-domText :: T.Text -> (SVEvent (WidgetSum path GnatEvent) :^: SVEmpty) :~> (SVSignal (WidgetProd path GnatDOM) :^: SVEmpty)
+domText :: T.Text -> Widget path SVEmpty SVEmpty
 domText text = ignore >>> (constant $ WidgetProdUnit $ Text text) >>> uncancelRight
 
-domElement :: T.Text -> [Attribute] -> (SVEvent (WidgetSum path GnatEvent) :^: SVEmpty) :~> (SVSignal (WidgetProd path GnatDOM) :^: SVEvent GnatEvent)
+domElement :: T.Text -> [Attribute] -> Widget path SVEmpty (SVEvent GnatEvent)
 domElement tag attributes =
   swap >>> (second $ filter sumStop) >>> (first $ constant $ WidgetProdUnit element)
   where
@@ -229,3 +240,55 @@ domElement tag attributes =
     element :: GnatDOM
     element = Element (\addedAttributes children -> custom (textToJSString tag) (attributes ++ addedAttributes) children)
 
+-- Copied from ghcjs-vdom/example/Example.hs
+atAnimationFrame :: IO () -> IO ()
+atAnimationFrame m = do
+  cb <- fixIO $ \cb ->
+    syncCallback ContinueAsync (releaseCallback cb >> m)
+  [js_| window.requestAnimationFrame(`cb); |]
+
+epochMillisecondsNow :: IO Int
+epochMillisecondsNow = [js| Date.now(); |]
+
+epochSecondsNow :: IO Double
+epochSecondsNow = fmap ((/ 1000) . fromIntegral) epochMillisecondsNow
+
+createRoot :: IO DOMNode
+createRoot = [js| document.createElement('div') |]
+
+attachRoot :: DOMNode -> IO ()
+attachRoot root = [js_| document.body.appendChild(`root); |]
+
+mkRoot :: IO DOMNode
+mkRoot = do
+  root <- createRoot
+  attachRoot root
+  return root
+
+runWidget :: Widget WidgetStop (SVEvent a) (SVEvent (IO a)) -> IO ()
+runWidget widget = do
+  root <- mkRoot
+  vmount <- mount root $ text ""
+  renderer <- mkRenderer
+  timeNow <- epochSecondsNow
+  widgetStateMVar <- newEmptyMVar
+  putMVar widgetStateMVar $ initSFEval
+    (signalHandler (\gnat ->
+       let pushDomEvent = (\domEvt -> do
+             evalState <- takeMVar widgetStateMVar
+             ((), evalState') <- runSFEvalT (push $ svLeft $ svOcc domEvt) evalState
+             putMVar widgetStateMVar evalState')
+           vnodes = compileGnat pushDomEvent gnat
+           vnode = custom "div" () vnodes
+       in render renderer vmount vnode)
+    `combineHandlers`
+    eventHandler (const $ return ()))
+    (sampleEvt `combineSamples` sampleEvt)
+    timeNow
+    widget
+  atAnimationFrame $ do
+    evalState <- takeMVar widgetStateMVar
+    timeNow <- epochSecondsNow
+    ((), evalState') <- runSFEvalT (step timeNow) evalState
+    putMVar widgetStateMVar $ evalState'
+ 
