@@ -229,6 +229,9 @@ data Key
 domText :: T.Text -> Widget path SVEmpty SVEmpty
 domText text = ignore >>> (constant $ WidgetProdUnit $ Text text) >>> uncancelRight
 
+dynamicDomText :: Widget path (SVSignal T.Text) SVEmpty
+dynamicDomText = first ignore >>> cancelLeft >>> pureSignalTransformer (WidgetProdUnit . Text) >>> uncancelRight
+
 domElement :: T.Text -> [Attribute] -> Widget path SVEmpty (SVEvent GnatEvent)
 domElement tag attributes =
   swap >>> (second $ filter sumStop) >>> (first $ constant $ WidgetProdUnit element)
@@ -239,6 +242,17 @@ domElement tag attributes =
     
     element :: GnatDOM
     element = Element (\addedAttributes children -> custom (textToJSString tag) (attributes ++ addedAttributes) children)
+
+dynamicDomElement :: T.Text -> [Attribute] -> Widget path (SVSignal [Attribute]) (SVEvent GnatEvent)
+dynamicDomElement tag attributes = 
+  swap >>> (second $ filter sumStop) >>> (first $ pureSignalTransformer $ WidgetProdUnit . element)
+  where
+    sumStop :: WidgetSum path a -> Maybe a
+    sumStop (WidgetSumStop x) = Just x
+    sumStop _ = Nothing
+
+    element :: [Attribute] -> GnatDOM
+    element signalAttributes = Element (\addedAttributes children -> custom (textToJSString tag) (signalAttributes ++ attributes ++ addedAttributes) children)
 
 -- Copied from ghcjs-vdom/example/Example.hs
 atAnimationFrame :: IO () -> IO ()
